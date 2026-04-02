@@ -48,17 +48,16 @@ object XxteaLib {
         val v = block.toUIntArray()   // v[0], v[1] – the two 32-bit words
         val k = key.toKeyArray()      // k[0..3] – four 32-bit key words
 
-        val n = 2
         val rounds = 32
         var sum = 0L
 
         for (i in 0 until rounds) {
             sum = (sum + DELTA) and 0xFFFFFFFFL
             val e = (sum ushr 2) and 3L
-            // Update v[0]
-            v[0] = ((v[0] + ((((v[1] shl 4) xor (v[1] ushr 5)) + v[1]) xor (sum + k[(e).toInt()]))) and 0xFFFFFFFFL)
-            // Update v[1]
-            v[1] = ((v[1] + ((((v[0] shl 4) xor (v[0] ushr 5)) + v[0]) xor ((sum + k[(e xor 1L).toInt()]))) ) and 0xFFFFFFFFL)
+            // Update v[0]: z == y == v[1]
+            v[0] = (v[0] + mx(v[1], sum, k, (0L xor e).toInt())) and 0xFFFFFFFFL
+            // Update v[1]: z == y == v[0] (already updated)
+            v[1] = (v[1] + mx(v[0], sum, k, (1L xor e).toInt())) and 0xFFFFFFFFL
         }
 
         return v.toByteArray()
@@ -83,14 +82,26 @@ object XxteaLib {
 
         for (i in 0 until rounds) {
             val e = (sum ushr 2) and 3L
-            // Undo v[1]
-            v[1] = ((v[1] - ((((v[0] shl 4) xor (v[0] ushr 5)) + v[0]) xor ((sum + k[(e xor 1L).toInt()])))) and 0xFFFFFFFFL)
-            // Undo v[0]
-            v[0] = ((v[0] - ((((v[1] shl 4) xor (v[1] ushr 5)) + v[1]) xor (sum + k[(e).toInt()]))) and 0xFFFFFFFFL)
+            // Undo v[1]: z == y == v[0]
+            v[1] = (v[1] - mx(v[0], sum, k, (1L xor e).toInt())) and 0xFFFFFFFFL
+            // Undo v[0]: z == y == v[1] (already updated)
+            v[0] = (v[0] - mx(v[1], sum, k, (0L xor e).toInt())) and 0xFFFFFFFFL
             sum = (sum - DELTA) and 0xFFFFFFFFL
         }
 
         return v.toByteArray()
+    }
+
+    /**
+     * XXTEA MX function, specialized for n=2 where z == y.
+     * MX = ((v>>5 ^ v<<2) + (v>>3 ^ v<<4)) ^ ((sum ^ v) + (key[idx] ^ v))
+     */
+    private fun mx(v: Long, sum: Long, k: LongArray, keyIdx: Int): Long {
+        val a = ((v ushr 5) xor ((v shl 2) and 0xFFFFFFFFL)) and 0xFFFFFFFFL
+        val b = ((v ushr 3) xor ((v shl 4) and 0xFFFFFFFFL)) and 0xFFFFFFFFL
+        val c = (sum xor v) and 0xFFFFFFFFL
+        val d = (k[keyIdx] xor v) and 0xFFFFFFFFL
+        return (((a + b) and 0xFFFFFFFFL) xor ((c + d) and 0xFFFFFFFFL))
     }
 
     /* ---- Message-level operations (multi-block) ---- */
