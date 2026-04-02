@@ -50,7 +50,7 @@
  *     → userInfo("waiting for measurement")
  *   COLLECTING_DATA
  *     → CMD_HISTORY_WEIGHT_DATA : parse + publish + send ack (ack causes scale to delete that record)
- *     → CMD_CUR_WEIGHT_DATA     : if measure_state == 2 (settled), parse + publish
+ *     → CMD_CUR_WEIGHT_DATA     : if measure_state >= 2 (settled), parse + publish
  */
 package com.health.openscale.core.bluetooth.scales
 
@@ -107,6 +107,9 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
     private var frameCounter = 0
     private var dhPrivateKey  = BigInteger.ZERO
     private var xxteaKey: ByteArray? = null
+    private var lastPublishedWeightRaw: Int? = null
+    private var lastPreviewWeightKg = -1f
+    private var currentWyzeUserId: ByteArray? = null
 
     // ─── supportFor ──────────────────────────────────────────────────────────
 
@@ -123,14 +126,16 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
                 DeviceCapability.USER_SYNC,
                 DeviceCapability.BODY_COMPOSITION,
                 DeviceCapability.HISTORY_READ,
-                DeviceCapability.LIVE_WEIGHT_STREAM
+                DeviceCapability.LIVE_WEIGHT_STREAM,
+                DeviceCapability.BATTERY_LEVEL
             ),
             implemented = setOf(
                 DeviceCapability.TIME_SYNC,
                 DeviceCapability.USER_SYNC,
                 DeviceCapability.BODY_COMPOSITION,
                 DeviceCapability.HISTORY_READ,
-                DeviceCapability.LIVE_WEIGHT_STREAM
+                DeviceCapability.LIVE_WEIGHT_STREAM,
+                DeviceCapability.BATTERY_LEVEL
             ),
             linkMode = LinkMode.CONNECT_GATT
         )
@@ -140,9 +145,7 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
 
     override fun onConnected(user: ScaleUser) {
         logI("Connected; starting key exchange")
-        state = State.INIT
-        frameCounter = 0
-        xxteaKey = null
+        resetState()
 
         setNotifyOn(WYZE_SERVICE, WYZE_CHAR)
 
@@ -171,8 +174,7 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
 
     override fun onDisconnected() {
         logI("Disconnected; resetting session state")
-        state = State.INIT
-        xxteaKey = null
+        resetState()
     }
 
     // ─── Notification handler ─────────────────────────────────────────────────
@@ -282,7 +284,12 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
     private fun handleSyncTimeReply(decrypted: ByteArray, user: ScaleUser) {
         if (state != State.WAIT_SYNC_TIME_REPLY) return
         val success = decrypted.size >= 7 && decrypted[6] == 0x00.toByte()
-        if (!success) { logW("SyncTime failed"); return }
+        if (!success) {
+            logW("SyncTime failed")
+            userWarn(R.string.bt_warn_command_failed, "SyncTime")
+            requestDisconnect()
+            return
+        }
         logI("Time synchronized; sending user profile")
         sendUpdateUser(user)
         state = State.WAIT_UPDATE_USER_REPLY
@@ -291,7 +298,12 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
     private fun handleUpdateUserReply(decrypted: ByteArray, user: ScaleUser) {
         if (state != State.WAIT_UPDATE_USER_REPLY) return
         val success = decrypted.size >= 7 && decrypted[6] == 0x00.toByte()
-        if (!success) { logW("UpdateUser failed"); return }
+        if (!success) {
+            logW("UpdateUser failed")
+            userWarn(R.string.bt_warn_command_failed, "UpdateUser")
+            requestDisconnect()
+            return
+        }
         logI("User profile saved to scale; selecting as current user")
         sendCurrentUserNew(user)
         state = State.WAIT_SET_CURRENT_USER_REPLY
@@ -300,7 +312,12 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
     private fun handleSetCurrentUserReply(decrypted: ByteArray, user: ScaleUser) {
         if (state != State.WAIT_SET_CURRENT_USER_REPLY) return
         val success = decrypted.size >= 7 && decrypted[6] == 0x00.toByte()
-        if (!success) { logW("SetCurrentUserNew failed"); return }
+        if (!success) {
+            logW("SetCurrentUserNew failed")
+            userWarn(R.string.bt_warn_command_failed, "SetCurrentUser")
+            requestDisconnect()
+            return
+        }
         logI("Current user set; awaiting measurements")
         state = State.COLLECTING_DATA
         userInfo(R.string.bt_info_waiting_for_measurement)
@@ -360,7 +377,13 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
 
         // Skip header (7 bytes)
         val timestamp  = buf.getInt(7).toLong() and 0xFFFFFFFFL
-        // user_id bytes 11–26 (16 bytes) – used only for logging
+        val recordUserId = decrypted.copyOfRange(11, 27)
+        val myUserId = currentWyzeUserId
+        if (myUserId != null && !recordUserId.contentEquals(myUserId)) {
+            logW("History record belongs to different user; skipping")
+            sendHistoryAck()
+            return
+        }
         val rawWeight  = buf.getShort(32).toInt() and 0xFFFF
         val impedance  = buf.getShort(34).toInt() and 0xFFFF
         val bfp        = buf.getShort(36).toInt() and 0xFFFF
@@ -375,6 +398,12 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
         // bmi at 51–52  – not stored
 
         val weightKg   = rawWeight / 100f
+
+        if (weightKg < 0.5f || weightKg > 300f) {
+            logW("Historical weight out of range: ${weightKg}kg; skipping")
+            sendHistoryAck()
+            return
+        }
 
         val measurement = ScaleMeasurement(
             userId   = user.id,
@@ -439,14 +468,30 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
         }
 
         val buf = ByteBuffer.wrap(decrypted).order(ByteOrder.LITTLE_ENDIAN)
+        val battery = decrypted[6].toInt() and 0xFF
         val measureState = decrypted[29].toInt() and 0xFF
         val rawWeight  = buf.getShort(30).toInt() and 0xFFFF
         val weightKg   = rawWeight / 100f
 
+        logD("Battery: $battery%")
+
         // measure_state 2 = weight settled, 4 = weight + body composition complete
         if (measureState < 2) {
+            if (kotlin.math.abs(weightKg - lastPreviewWeightKg) >= 0.05f) {
+                userInfo(R.string.bluetooth_scale_info_measuring_weight, weightKg)
+                lastPreviewWeightKg = weightKg
+            }
             logD("Live weight: ${weightKg}kg (state=$measureState, stabilising)")
-            userInfo(R.string.bluetooth_scale_info_measuring_weight, weightKg)
+            return
+        }
+
+        if (weightKg < 0.5f || weightKg > 300f) {
+            logW("Final weight out of range: ${weightKg}kg; skipping")
+            return
+        }
+
+        if (lastPublishedWeightRaw == rawWeight) {
+            logD("Duplicate final weight ${weightKg}kg (state=$measureState); skipping")
             return
         }
 
@@ -473,8 +518,10 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
             impedance = impedance.toDouble()
         )
 
-        logI("Final live weight: ${weightKg}kg (state=$measureState)")
+        lastPublishedWeightRaw = rawWeight
+        logI("Final live weight: ${weightKg}kg (state=$measureState, battery=$battery%)")
         publish(measurement)
+        requestDisconnect()
     }
 
     // ─── Commands sent to the scale ───────────────────────────────────────────
@@ -550,6 +597,7 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
      */
     private fun buildUserPayload(cmd: Byte, user: ScaleUser): ByteArray {
         val userId   = getUserIdFor(user)
+        currentWyzeUserId = userId
         val lastMeas = lastMeasurementFor(user.id)
         val rawWeight = ((lastMeas?.weight ?: 0f) * 100).toInt().coerceIn(0, 0xFFFF)
         val lastImp   = lastMeas?.impedance?.toInt()?.coerceIn(0, 0xFFFF) ?: 0
@@ -624,6 +672,16 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
         ciphertext.copyInto(msg, 4)
 
         writeTo(WYZE_SERVICE, WYZE_CHAR, msg, withResponse = true)
+    }
+
+    private fun resetState() {
+        state = State.INIT
+        frameCounter = 0
+        dhPrivateKey = BigInteger.ZERO
+        xxteaKey = null
+        lastPublishedWeightRaw = null
+        lastPreviewWeightKg = -1f
+        currentWyzeUserId = null
     }
 
     // ─── Utility ──────────────────────────────────────────────────────────────

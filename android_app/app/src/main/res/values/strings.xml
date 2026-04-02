@@ -744,6 +744,7 @@
     <string name="bt_warn_slots_full">The scale has no free user slots. Delete a user on the device and try again.</string>
     <string name="bt_warn_notify_failed">Failed to enable notifications for %1$s.</string>
     <string name="bt_warn_write_failed">Write to %1$s failed.</string>
+    <string name="bt_warn_command_failed">Scale command failed: %1$s</string>
     <string name="bt_warn_notify_state_failed">Changing notify state for %1$s failed.</string>
     <string name="bt_warn_consent_wrong_retry">Consent code was not accepted. Please check and try again.</string>
 
