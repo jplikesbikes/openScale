@@ -438,17 +438,18 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
             return
         }
 
+        val buf = ByteBuffer.wrap(decrypted).order(ByteOrder.LITTLE_ENDIAN)
         val measureState = decrypted[29].toInt() and 0xFF
-        if (measureState != 2) {
-            // Still stabilising – log but don't publish
-            val buf = ByteBuffer.wrap(decrypted).order(ByteOrder.LITTLE_ENDIAN)
-            val rawW = buf.getShort(30).toInt() and 0xFFFF
-            logD("Live weight: ${rawW / 100f}kg (state=$measureState, not final)")
+        val rawWeight  = buf.getShort(30).toInt() and 0xFFFF
+        val weightKg   = rawWeight / 100f
+
+        // measure_state 2 = weight settled, 4 = weight + body composition complete
+        if (measureState < 2) {
+            logD("Live weight: ${weightKg}kg (state=$measureState, stabilising)")
+            userInfo(R.string.bluetooth_scale_info_measuring_weight, weightKg)
             return
         }
 
-        val buf = ByteBuffer.wrap(decrypted).order(ByteOrder.LITTLE_ENDIAN)
-        val rawWeight  = buf.getShort(30).toInt() and 0xFFFF
         val impedance  = buf.getShort(32).toInt() and 0xFFFF
         val bfp        = buf.getShort(34).toInt() and 0xFFFF
         val muscleMass = buf.getShort(36).toInt() and 0xFFFF
@@ -457,8 +458,6 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
         val lbm        = buf.getShort(43).toInt() and 0xFFFF
         val vfal       = decrypted[45].toInt() and 0xFF
         val bmr        = buf.getShort(46).toInt() and 0xFFFF
-
-        val weightKg = rawWeight / 100f
 
         val measurement = ScaleMeasurement(
             userId    = user.id,
@@ -474,7 +473,7 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
             impedance = impedance.toDouble()
         )
 
-        logI("Final live weight: ${weightKg}kg")
+        logI("Final live weight: ${weightKg}kg (state=$measureState)")
         publish(measurement)
     }
 
