@@ -473,7 +473,9 @@ class WyzeScaleHandler : ScaleDeviceHandler() {
         val rawWeight  = buf.getShort(30).toInt() and 0xFFFF
         val weightKg   = rawWeight / 100f
 
-        logD("Battery: $battery%")
+        if (battery in 1..10) {
+            userWarn(R.string.bt_warn_low_battery, battery)
+        }
 
         // measure_state 2 = weight settled, 4 = weight + body composition complete
         if (measureState < 2) {
